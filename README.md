@@ -18,11 +18,12 @@
    Has Unit test cases for the functions in delivery_scheduler
     
 ## s3-sftp_1_9_2020.py
-   This is the National Clearinghouse project that is discussed , script transports objects on s3 to a secured SFTP folder 
+   This is the National Clearinghouse project, The script transports objects on s3 to a secured SFTP folder as a intermediatory step
    
 ## you_visit_api.py 
-   This is the project being discussed , also with a potential bug due to global variables defined which was rectified causing leakage in parallel run times. 
-   It hits a api , gets the records and iterates based on records/api call , updates a postgres database , and creates a csv file based on api calls 
-   The thing to note is the headers are created dynamically and not hardcoded based on changing heeader requiorements by comparing to a previous header.
+  The projects gets leads from the you_visit API for furthur ingestion into a snowflake based postgres datastore, also with a potential bug due to global variables defined which     was rectified causing leakage in parallel run times. 
+  
+  It hits a api , gets the records and iterates based on records/api call , updates a postgres database , and creates a csv file based on api calls 
+  The thing to note is the headers are created dynamically and not hardcoded based on changing heeader requirements by comparing to a previous header.
     
    
