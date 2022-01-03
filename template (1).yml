@@ -1,0 +1,374 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+
+Parameters:
+  Environment:
+    Default: dev
+    Type: String
+  TeamVpcStack:
+    Description: 'Name of CloudFormation stack that owns the VPC.  The stack''s exported output values are used as input to this template.'
+    Type: String
+    Default: CoreTeam-Dev
+  AmazonMQBrokerUser:
+    Description: The user to access the Amazon MQ broker.
+    Type: String
+
+  AmazonMQBrokerPassword:
+      Description: The password to access the Amazon MQ broker. Min 12 characters
+      Type: String
+      NoEcho: true
+
+
+  TargetStage:
+    Description: Stage to which alerting platform is deployed.
+    Type: String
+    Default: v1
+  sourceIpRanges:
+    Description: 'Comma-delimited list of source IP address ranges that are allowed to access the private API.'
+    Type: CommaDelimitedList
+    Default: '10.41.0.0/16,10.131.112.0/20,10.140.0.0/16'
+  MarketingAppsWebhookURL:
+    Description: 'URL for the marketing apps slack webhook call to post to the es-core-alerts '
+    Type: String
+    Default : 'https://hooks.slack.com/services/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'
+  StackEnvironment:
+    Description: 'The environment of this stack, to be used to determine environment of calling application'
+    Type: String
+    Default: CoreTeam-Dev
+
+
+
+# Global definitions to cut down on boilerplate cf
+Globals:
+  Function:
+    MemorySize: 128
+    Runtime: python3.8
+    Timeout: 300
+
+Resources:
+  AMQBroker1:
+    Type: AWS::AmazonMQ::Broker
+    Properties:
+      BrokerName: !Sub 'activemq-pool0-${Environment}'
+      DeploymentMode: ACTIVE_STANDBY_MULTI_AZ
+      EngineType: ACTIVEMQ
+      EngineVersion: 5.16.3
+      HostInstanceType: mq.m4.large
+      Logs:
+        Audit: true
+        General: true
+      PubliclyAccessible: false
+      AutoMinorVersionUpgrade: false
+      SecurityGroups:
+        - !Sub '${AMQSecurityGroup.GroupId}'
+      SubnetIds:
+        - Fn::ImportValue: !Sub '${TeamVpcStack}-SubnetGreenA'
+        - Fn::ImportValue: !Sub '${TeamVpcStack}-SubnetGreenB'
+      Users:
+        - ConsoleAccess: true
+          Groups:
+            - admin
+          Username: !Sub '${AmazonMQBrokerUser}'
+          Password: !Sub '${AmazonMQBrokerPassword}'
+
+  Alarm1:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: consumer-count-atlas
+      AlarmDescription: "Consumer Count decreased  over a 15 minute average by 2 standard deviation from average "
+      ActionsEnabled: true
+      OKActions: []
+      AlarmActions:
+        - !Ref MarketingAppsFailuresSNSTopic
+      InsufficientDataActions: []
+      Dimensions: []
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      ComparisonOperator: LessThanLowerThreshold
+      TreatMissingData: missing
+      Metrics:
+        - Id: m1
+          ReturnData: true
+          MetricStat:
+            Metric:
+              Namespace: AWS/AmazonMQ
+              MetricName: TotalConsumerCount
+              Dimensions:
+                - Name: Broker
+                  Value: !Sub 'activemq-pool0-${Environment}'
+            Period: 900
+            Stat: Average
+        - Id: ad1
+          Label: TotalConsumerCount (expected)
+          ReturnData: true
+          Expression: ANOMALY_DETECTION_BAND(m1, 2)
+      ThresholdMetricId: ad1
+
+
+  Alarm2:
+      Type: AWS::CloudWatch::Alarm
+      Properties:
+          AlarmName: CPU-utilization
+          AlarmDescription:  CPU Utilization of underlying EC2 instance for Amazon MQ Queue is > 80 %
+              over a 15 min time average.
+          ActionsEnabled: true
+          OKActions: []
+          AlarmActions:
+              - !Ref MarketingAppsFailuresSNSTopic
+          InsufficientDataActions: []
+          MetricName: CpuUtilization
+          Namespace: AWS/AmazonMQ
+          Statistic: Average
+          Dimensions:
+              - Name: Broker
+                Value: !Sub 'activemq-pool0-${Environment}'
+          Period: 900
+          EvaluationPeriods: 1
+          DatapointsToAlarm: 1
+          Threshold: 80
+          ComparisonOperator: GreaterThanThreshold
+          TreatMissingData: missing
+
+
+  SlackAlertLambda:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../src/functions
+      Handler: alert_slack.alert_slack.lambda_handler
+      Role:
+        Fn::GetAtt:
+          - SlackAlertLambdaRole
+          - Arn
+      Environment:
+        Variables:
+          MARKETING_APPS_WEBHOOK_URL: !Ref MarketingAppsWebhookURL
+  SlackLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    DependsOn: SlackAlertLambda
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${SlackAlertLambda}
+      RetentionInDays: 30
+  SlackAlertLambdaRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Policies:
+        - PolicyName: invokeFunction
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: '*'
+                Sid: 57b8eff3d1ad4e1eaf0489cecce6432d
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: arn:aws:logs:*:*:*
+
+  SlackAlertLambdaInvokePermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !Ref SlackAlertLambda
+      Principal: sns.amazonaws.com
+
+  GlobalFailuresSNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      Subscription:
+        - Endpoint: !GetAtt SlackAlertLambda.Arn
+          Protocol: "lambda"
+
+  MarketingAppsFailuresSNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "ActiveMQ-alerts-sns-topic-${StackEnvironment}"
+      Subscription:
+        - Endpoint: !GetAtt SlackAlertLambda.Arn
+          Protocol: "lambda"
+
+
+
+  AMQSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub 'CloudFormation-stack-specific security group through which the VPC-based Amazon MQ brokers are accessed.'
+      VpcId:
+        Fn::ImportValue: !Sub '${TeamVpcStack}-ID'
+      SecurityGroupEgress:
+        - CidrIp: 0.0.0.0/0
+          Description: "Allow all outbound IPv4 traffic."
+          IpProtocol: "-1"
+      SecurityGroupIngress:
+        - Description: 'EAB ES North Run WiFi'
+          CidrIp: 10.32.40.0/21
+          FromPort: 61617
+          ToPort: 61617
+          IpProtocol: tcp
+        - Description: 'EAB Cato VPN'
+          CidrIp: 10.41.0.0/16
+          FromPort: 61617
+          ToPort: 61617
+          IpProtocol: tcp
+        - Description: 'EAB ES North Run Ethernet'
+          CidrIp: 10.32.110.0/23
+          FromPort: 61617
+          ToPort: 61617
+          IpProtocol: tcp
+        - Description: 'EAB GitLab CI'
+          CidrIp: 10.114.0.0/16
+          FromPort: 61617
+          ToPort: 61617
+          IpProtocol: tcp
+        - Description: 'EAB Nomad-Containers'
+          CidrIp: 172.17.0.0/26
+          FromPort: 61617
+          ToPort: 61617
+          IpProtocol: tcp
+        - Description: 'EAB Dev Nomad-Green'
+          CidrIp: 172.19.32.0/24
+          FromPort: 61617
+          ToPort: 61617
+          IpProtocol: tcp
+        - Description: 'EAB Prod Nomad-Green'
+          CidrIp: 10.140.123.0/24
+          FromPort: 61617
+          ToPort: 61617
+          IpProtocol: tcp
+        - Description: 'EAB ES Marketing Apps Subnet Green A'
+          CidrIp:
+            Fn::ImportValue: !Sub '${TeamVpcStack}-CidrGreenA'
+          FromPort: 61617
+          ToPort: 61617
+          IpProtocol: tcp
+        - Description: 'EAB ES Marketing Apps Subnet Green B'
+          CidrIp:
+            Fn::ImportValue: !Sub '${TeamVpcStack}-CidrGreenB'
+          FromPort: 61617
+          ToPort: 61617
+          IpProtocol: tcp
+        - Description: 'EAB ES Marketing Apps Subnet Green C'
+          CidrIp:
+            Fn::ImportValue: !Sub '${TeamVpcStack}-CidrGreenC'
+          FromPort: 61617
+          ToPort: 61617
+          IpProtocol: tcp
+        - Description: 'EAB Corporate-IT-issued Amazon Workspaces for Contractors'
+          CidrIp: 10.137.36.0/23
+          FromPort: 61617
+          ToPort: 61617
+          IpProtocol: tcp
+        - Description: 'EAB ES North Run WiFi'
+          CidrIp: 10.32.40.0/21
+          FromPort: 8162
+          ToPort: 8162
+          IpProtocol: tcp
+        - Description: 'EAB Cato VPN'
+          CidrIp: 10.41.0.0/16
+          FromPort: 8162
+          ToPort: 8162
+          IpProtocol: tcp
+        - Description: 'EAB ES North Run Ethernet'
+          CidrIp: 10.32.110.0/23
+          FromPort: 8162
+          ToPort: 8162
+          IpProtocol: tcp
+        - Description: 'EAB GitLab CI'
+          CidrIp: 10.114.0.0/16
+          FromPort: 8162
+          ToPort: 8162
+          IpProtocol: tcp
+        - Description: 'EAB ES Marketing Apps Subnet Green A'
+          CidrIp:
+            Fn::ImportValue: !Sub '${TeamVpcStack}-CidrGreenA'
+          FromPort: 8162
+          ToPort: 8162
+          IpProtocol: tcp
+        - Description: 'EAB ES Marketing Apps Subnet Green B'
+          CidrIp:
+            Fn::ImportValue: !Sub '${TeamVpcStack}-CidrGreenB'
+          FromPort: 8162
+          ToPort: 8162
+          IpProtocol: tcp
+        - Description: 'EAB ES Marketing Apps Subnet Green C'
+          CidrIp:
+            Fn::ImportValue: !Sub '${TeamVpcStack}-CidrGreenC'
+          FromPort: 8162
+          ToPort: 8162
+          IpProtocol: tcp
+        - Description: 'EAB Corporate-IT-issued Amazon Workspaces for Contractors'
+          CidrIp: 10.137.36.0/23
+          FromPort: 8162
+          ToPort: 8162
+          IpProtocol: tcp
+      Tags:
+        - Key: Name
+          Value: !Join
+            - '-'
+            - - !Ref 'AWS::StackName'
+              - AMQSecurityGroup
+
+  ConfigurationAssociation1:
+    Type: AWS::AmazonMQ::ConfigurationAssociation
+    Properties:
+      Broker: {Ref: AMQBroker1}
+      Configuration:
+        Id: {Ref: Configuration1}
+        Revision: {'Fn::GetAtt': [Configuration1, Revision]}
+
+  Configuration1:
+    Properties:
+      Data:
+        ? "Fn::Base64"
+        : |
+            <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+            <broker xmlns="http://activemq.apache.org/schema/core" start="false">
+              <destinationPolicy>
+                <policyMap>
+                  <policyEntries>
+                    <policyEntry topic=">">
+                      <pendingMessageLimitStrategy>
+                        <constantPendingMessageLimitStrategy limit="3000"/>
+                      </pendingMessageLimitStrategy>
+                    </policyEntry>
+                  </policyEntries>
+                </policyMap>
+              </destinationPolicy>
+              <plugins>
+              </plugins>
+            </broker>
+      Description: Generated configuration to build a network of brokers.
+      EngineType: ACTIVEMQ
+      EngineVersion: 5.15.9
+      Name: NoB1Configuration
+    Type: AWS::AmazonMQ::Configuration
+
+
+Outputs:
+  StackSNSTopic:
+    Description: ARN of the Legacy SNS topic to hold errors before they are alerts
+    Value: !Ref GlobalFailuresSNSTopic
+    Export:
+      Name: !Sub "${StackEnvironment}-Core-Alerting-Topic"
+  MarketingAppsSNSTopic:
+    Description: ARN of the Marketing Apps SNS topic to hold errors before they are alerts
+    Value: !Ref MarketingAppsFailuresSNSTopic
+    Export:
+      Name: !Sub "${StackEnvironment}-ActiveMQ-Alerting-Topic"
+  MarketingAppsSNSTopicName:
+    Description: Topic name for Marketing Apps SNS
+    Value: !Sub "ActiveMQ-alerts-sns-topic-${StackEnvironment}"
+    Export:
+      Name: !Sub "${StackEnvironment}-ActiveMQ-Alerting-Topic-Name"
